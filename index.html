@@ -11,17 +11,24 @@
   #map { position: fixed; inset: 0; }
   .panel {
     position: fixed; left: 12px; right: 12px; top: 12px; z-index: 1000;
-    background: rgba(255,255,255,.96); border-radius: 16px; padding: 12px 14px;
-    box-shadow: 0 4px 18px rgba(0,0,0,.18);
+    background: rgba(255,255,255,.97); border-radius: 16px; padding: 12px 14px;
+    box-shadow: 0 4px 18px rgba(0,0,0,.18); max-height: 62vh; overflow-y: auto;
   }
   .panel h1 { margin: 0 0 4px; font-size: 20px; }
   .panel p { margin: 0 0 8px; font-size: 14px; line-height: 1.35; }
-  .row { display: flex; gap: 8px; }
+  .row { display: flex; gap: 8px; margin-bottom: 8px; }
   input { flex: 1; min-width: 0; padding: 10px; border: 1px solid #bbb; border-radius: 10px; font-size: 16px; }
-  button { padding: 10px 14px; border: 0; border-radius: 10px; background: #111827; color: #fff; font-size: 16px; }
-  .status { margin-top: 8px; font-size: 14px; font-weight: 600; }
+  button { padding: 10px 12px; border: 0; border-radius: 10px; background: #111827; color: #fff; font-size: 15px; }
+  button.light { background: #e5e7eb; color: #111827; }
+  .status { font-size: 14px; font-weight: 700; margin: 6px 0; }
+  .driver { border-top: 1px solid #e5e7eb; padding: 8px 0; }
+  .driver b { font-size: 16px; }
+  .driver .meta { font-size: 14px; color: #374151; margin: 2px 0 6px; }
+  .driver .actions { display: flex; gap: 6px; flex-wrap: wrap; }
+  .driver .actions a, .driver .actions button { font-size: 14px; padding: 8px 10px; border-radius: 9px; text-decoration: none; }
+  .driver .actions a { background: #16a34a; color: #fff; }
   .pin {
-    width: 30px; height: 30px; border-radius: 50%; border: 3px solid #111;
+    width: 32px; height: 32px; border-radius: 50%; border: 3px solid #111;
     display: flex; align-items: center; justify-content: center;
     color: #fff; font-weight: 800; font-size: 15px;
   }
@@ -31,19 +38,55 @@
 <div id="map"></div>
 <div class="panel">
   <h1>TAiXI Monitor</h1>
-  <p id="notice">Pantalla de monitoreo lista. Todavía no muestra choferes reales: falta la conexión privada de TAiXI que debe habilitar Steven.</p>
+  <p>Monitor separado de TAiXI. Agrega a cada chofer con su número y envíale su enlace personal. La lista se guarda solo en este navegador.</p>
   <div class="row">
-    <input id="token" type="password" placeholder="Clave de acceso TAiXI" autocomplete="off">
-    <button id="connect">Conectar</button>
+    <input id="name" placeholder="Nombre del chofer" autocomplete="off">
+    <input id="phone" placeholder="Teléfono" inputmode="tel" autocomplete="off">
   </div>
-  <div class="status" id="status">Sin conexión</div>
+  <div class="row">
+    <button id="add">Agregar chofer</button>
+  </div>
+  <div class="status" id="status">Conectando…</div>
+  <div id="list"></div>
 </div>
 
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="https://unpkg.com/mqtt/dist/mqtt.min.js"></script>
 <script>
-  // La dirección privada la entregará Steven. Nunca se guarda una clave en este archivo.
-  const DRIVERS_ENDPOINT = "";
-  const REFRESH_MS = 15000;
+  const BROKER = "wss://broker.hivemq.com:8884/mqtt";
+  const LS_CHANNEL = "taixiMonitorChannel";
+  const LS_DRIVERS = "taixiMonitorDrivers";
+
+  function randomHex(bytes) {
+    const a = new Uint8Array(bytes);
+    crypto.getRandomValues(a);
+    return Array.from(a, b => b.toString(16).padStart(2, "0")).join("");
+  }
+  function b64u(bytes) {
+    let s = "";
+    bytes.forEach(b => { s += String.fromCharCode(b); });
+    return btoa(s).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+  }
+  function unb64u(str) {
+    str = str.replace(/-/g, "+").replace(/_/g, "/");
+    while (str.length % 4) str += "=";
+    const s = atob(str);
+    const a = new Uint8Array(s.length);
+    for (let i = 0; i < s.length; i++) a[i] = s.charCodeAt(i);
+    return a;
+  }
+  function esc(s) {
+    return String(s || "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+  }
+
+  let channel = localStorage.getItem(LS_CHANNEL);
+  if (!channel) {
+    channel = randomHex(16);
+    localStorage.setItem(LS_CHANNEL, channel);
+  }
+  let drivers = [];
+  try { drivers = JSON.parse(localStorage.getItem(LS_DRIVERS) || "[]"); } catch (e) { drivers = []; }
+  function saveDrivers() { localStorage.setItem(LS_DRIVERS, JSON.stringify(drivers)); }
 
   const map = L.map("map").setView([26.142, -81.795], 12);
   L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
@@ -52,76 +95,131 @@
   }).addTo(map);
 
   const markers = new Map();
+  const lastSeen = new Map();
   const statusEl = document.getElementById("status");
-  let timer = null;
+  const listEl = document.getElementById("list");
 
-  function colorFor(driver) {
-    const ageMin = (Date.now() - new Date(driver.updated_at).getTime()) / 60000;
-    if (ageMin > 15) return "#f97316"; // ubicación vieja: fuerte y visible
-    if (driver.status === "to_pickup") return "#2563eb";
-    if (driver.status === "in_trip") return "#7c3aed";
-    return "#16a34a";
+  function driverLink(d) {
+    const base = location.origin + location.pathname.replace(/[^/]*$/, "");
+    return base + "compartir.html#c=" + channel + "&d=" + d.code + "&k=" + d.key;
+  }
+  function waLink(d) {
+    let digits = String(d.phone || "").replace(/\D/g, "");
+    if (digits.length === 10) digits = "1" + digits;
+    const text = "Hola " + d.name + ", este es tu enlace para compartir tu ubicación con TAiXI Monitor mientras trabajas: " + driverLink(d) + " Ábrelo y toca Compartir mi ubicación.";
+    return "https://wa.me/" + digits + "?text=" + encodeURIComponent(text);
   }
 
-  function ageText(updatedAt) {
-    const mins = Math.max(0, Math.round((Date.now() - new Date(updatedAt).getTime()) / 60000));
+  function renderList() {
+    if (!drivers.length) {
+      listEl.innerHTML = "<p>Todavía no hay choferes en la lista.</p>";
+      return;
+    }
+    listEl.innerHTML = drivers.map(d => {
+      const seen = lastSeen.get(d.code);
+      const state = seen ? "Compartiendo · " + ageText(seen.t) : "Sin ubicación todavía";
+      return '<div class="driver"><b>' + esc(d.name) + '</b>' +
+        '<div class="meta">' + esc(d.phone) + " · " + state + "</div>" +
+        '<div class="actions">' +
+        '<a href="' + waLink(d) + '" target="_blank" rel="noopener">Enviar por WhatsApp</a>' +
+        '<button class="light" data-copy="' + d.code + '">Copiar enlace</button>' +
+        '<button class="light" data-remove="' + d.code + '">Quitar</button>' +
+        "</div></div>";
+    }).join("");
+    listEl.querySelectorAll("[data-copy]").forEach(btn => {
+      btn.addEventListener("click", async () => {
+        const d = drivers.find(x => x.code === btn.dataset.copy);
+        try { await navigator.clipboard.writeText(driverLink(d)); btn.textContent = "Copiado"; }
+        catch (e) { prompt("Copia el enlace:", driverLink(d)); }
+      });
+    });
+    listEl.querySelectorAll("[data-remove]").forEach(btn => {
+      btn.addEventListener("click", () => {
+        const d = drivers.find(x => x.code === btn.dataset.remove);
+        if (!confirm("¿Quitar a " + d.name + " de la lista? Su enlace dejará de funcionar en este mapa.")) return;
+        drivers = drivers.filter(x => x.code !== d.code);
+        saveDrivers();
+        if (markers.has(d.code)) { map.removeLayer(markers.get(d.code)); markers.delete(d.code); }
+        lastSeen.delete(d.code);
+        renderList();
+      });
+    });
+  }
+
+  document.getElementById("add").addEventListener("click", () => {
+    const name = document.getElementById("name").value.trim();
+    const phone = document.getElementById("phone").value.trim();
+    if (!name || !phone) { alert("Escribe el nombre y el teléfono del chofer."); return; }
+    drivers.push({ name, phone, code: randomHex(4), key: b64u(crypto.getRandomValues(new Uint8Array(32))) });
+    saveDrivers();
+    document.getElementById("name").value = "";
+    document.getElementById("phone").value = "";
+    renderList();
+  });
+
+  function ageText(t) {
+    const mins = Math.max(0, Math.round((Date.now() - t) / 60000));
     if (mins < 1) return "ahora";
     if (mins < 60) return "hace " + mins + " min";
     return "hace " + Math.round(mins / 60) + " h";
   }
-
-  function iconFor(driver) {
+  function iconFor(d, t) {
+    const fresh = (Date.now() - t) < 120000;
+    const color = fresh ? "#16a34a" : "#f97316";
+    const letter = esc((d.name || "T").trim().charAt(0).toUpperCase() || "T");
     return L.divIcon({
       className: "",
-      html: '<div class="pin" style="background:' + colorFor(driver) + '">T</div>',
-      iconSize: [30, 30],
-      iconAnchor: [15, 15]
+      html: '<div class="pin" style="background:' + color + '">' + letter + "</div>",
+      iconSize: [32, 32],
+      iconAnchor: [16, 16]
     });
   }
-
-  function showDrivers(drivers) {
-    const seen = new Set();
-    drivers.forEach(driver => {
-      if (!Number.isFinite(driver.lat) || !Number.isFinite(driver.lng)) return;
-      seen.add(driver.id);
-      const popup = "<b>" + (driver.name || "Chofer") + "</b><br>" +
-        (driver.car || "") + " " + (driver.plate || "") + "<br>" +
-        (driver.phone || "") + "<br>Ubicación: " + ageText(driver.updated_at);
-      if (markers.has(driver.id)) {
-        markers.get(driver.id).setLatLng([driver.lat, driver.lng]).setIcon(iconFor(driver)).setPopupContent(popup);
-      } else {
-        markers.set(driver.id, L.marker([driver.lat, driver.lng], { icon: iconFor(driver) }).addTo(map).bindPopup(popup));
-      }
-    });
-    markers.forEach((marker, id) => {
-      if (!seen.has(id)) { map.removeLayer(marker); markers.delete(id); }
-    });
-    statusEl.textContent = "Choferes en el mapa: " + seen.size;
-  }
-
-  async function loadDrivers() {
-    if (!DRIVERS_ENDPOINT) {
-      statusEl.textContent = "Sin conexión: falta la dirección privada de TAiXI";
-      return;
+  function showDriver(d, pos) {
+    lastSeen.set(d.code, pos);
+    const popup = "<b>" + esc(d.name) + "</b><br>" + esc(d.phone) + "<br>Ubicación: " + ageText(pos.t);
+    if (markers.has(d.code)) {
+      markers.get(d.code).setLatLng([pos.lat, pos.lng]).setIcon(iconFor(d, pos.t)).setPopupContent(popup);
+    } else {
+      markers.set(d.code, L.marker([pos.lat, pos.lng], { icon: iconFor(d, pos.t) }).addTo(map).bindPopup(popup));
     }
-    const token = document.getElementById("token").value.trim();
-    try {
-      const res = await fetch(DRIVERS_ENDPOINT, {
-        headers: token ? { "Authorization": "Bearer " + token } : {}
-      });
-      if (!res.ok) throw new Error("HTTP " + res.status);
-      const data = await res.json();
-      showDrivers(Array.isArray(data) ? data : data.drivers || []);
-    } catch (e) {
-      statusEl.textContent = "No se pudo conectar con TAiXI";
-    }
+    statusEl.textContent = "Choferes compartiendo: " + markers.size;
+    renderList();
   }
 
-  document.getElementById("connect").addEventListener("click", () => {
-    loadDrivers();
-    if (timer) clearInterval(timer);
-    timer = setInterval(loadDrivers, REFRESH_MS);
+  async function decryptPos(d, payload) {
+    const key = await crypto.subtle.importKey("raw", unb64u(d.key), { name: "AES-GCM" }, false, ["decrypt"]);
+    const plain = await crypto.subtle.decrypt({ name: "AES-GCM", iv: unb64u(payload.iv) }, key, unb64u(payload.ct));
+    return JSON.parse(new TextDecoder().decode(plain));
+  }
+
+  const client = mqtt.connect(BROKER, { clientId: "taixi-monitor-" + randomHex(6), reconnectPeriod: 5000 });
+  client.on("connect", () => {
+    statusEl.textContent = "Conectado. Choferes compartiendo: " + markers.size;
+    client.subscribe("taixi-monitor/" + channel + "/+");
   });
+  client.on("reconnect", () => { statusEl.textContent = "Reconectando…"; });
+  client.on("error", () => { statusEl.textContent = "Sin conexión con el servicio de ubicaciones"; });
+  client.on("message", async (topic, message) => {
+    const code = topic.split("/").pop();
+    const d = drivers.find(x => x.code === code);
+    if (!d) return;
+    try {
+      const payload = JSON.parse(message.toString());
+      const pos = await decryptPos(d, payload);
+      if (Number.isFinite(pos.lat) && Number.isFinite(pos.lng)) showDriver(d, pos);
+    } catch (e) { /* mensaje no válido para este chofer */ }
+  });
+
+  setInterval(() => {
+    markers.forEach((marker, code) => {
+      const d = drivers.find(x => x.code === code);
+      const pos = lastSeen.get(code);
+      if (d && pos) marker.setIcon(iconFor(d, pos.t));
+    });
+    renderList();
+  }, 30000);
+
+  renderList();
 </script>
 </body>
 </html>
