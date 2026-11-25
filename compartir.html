@@ -32,18 +32,16 @@
   <p class="small">Mantén esta página abierta y el teléfono cargando mientras trabajas. Si bloqueas la pantalla, el envío puede pausarse.</p>
 </div>
 
-<script src="https://unpkg.com/mqtt/dist/mqtt.min.js"></script>
 <script>
-  const BROKER = "wss://broker.hivemq.com:8884/mqtt";
   const params = new URLSearchParams(location.hash.replace(/^#/, ""));
   const channel = params.get("c") || "";
   const code = params.get("d") || "";
   const keyText = params.get("k") || "";
+  const topic = "taixi-monitor-" + channel;
 
   const statusEl = document.getElementById("status");
   const startBtn = document.getElementById("start");
   const stopBtn = document.getElementById("stop");
-  let client = null;
   let watchId = null;
   let lastSent = 0;
   let wakeLock = null;
@@ -72,7 +70,7 @@
     const iv = crypto.getRandomValues(new Uint8Array(12));
     const data = new TextEncoder().encode(JSON.stringify(pos));
     const ct = await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, data);
-    return JSON.stringify({ v: 1, iv: b64u(iv), ct: b64u(new Uint8Array(ct)) });
+    return JSON.stringify({ d: code, iv: b64u(iv), ct: b64u(new Uint8Array(ct)) });
   }
 
   async function sendPos(position) {
@@ -86,7 +84,8 @@
     };
     try {
       const payload = await encryptPos(pos);
-      client.publish("taixi-monitor/" + channel + "/" + code, payload);
+      const res = await fetch("https://ntfy.sh/" + topic, { method: "POST", body: payload });
+      if (!res.ok) throw new Error("HTTP " + res.status);
       statusEl.textContent = "Compartiendo tu ubicación · " + new Date(now).toLocaleTimeString();
     } catch (e) {
       statusEl.textContent = "No se pudo enviar la ubicación. Revisa tu conexión.";
@@ -98,33 +97,26 @@
     else statusEl.textContent = "No se pudo obtener tu ubicación. Revisa que el GPS esté activado.";
   }
 
-  startBtn.addEventListener("click", () => {
+  startBtn.addEventListener("click", async () => {
     if (!("geolocation" in navigator)) {
       statusEl.textContent = "Este teléfono no permite compartir ubicación desde el navegador.";
       return;
     }
-    statusEl.textContent = "Conectando…";
-    client = mqtt.connect(BROKER, { clientId: "taixi-driver-" + code + "-" + Math.random().toString(16).slice(2, 8), reconnectPeriod: 5000 });
-    client.on("connect", async () => {
-      statusEl.textContent = "Conectado. Buscando tu ubicación…";
-      startBtn.style.display = "none";
-      stopBtn.style.display = "block";
-      try { wakeLock = await navigator.wakeLock.request("screen"); } catch (e) { /* sin wake lock */ }
-      watchId = navigator.geolocation.watchPosition(sendPos, geoError, {
-        enableHighAccuracy: true,
-        maximumAge: 10000,
-        timeout: 20000
-      });
+    statusEl.textContent = "Buscando tu ubicación…";
+    startBtn.style.display = "none";
+    stopBtn.style.display = "block";
+    try { wakeLock = await navigator.wakeLock.request("screen"); } catch (e) { /* sin wake lock */ }
+    watchId = navigator.geolocation.watchPosition(sendPos, geoError, {
+      enableHighAccuracy: true,
+      maximumAge: 10000,
+      timeout: 20000
     });
-    client.on("error", () => { statusEl.textContent = "Sin conexión. Revisa tu internet."; });
   });
 
   stopBtn.addEventListener("click", () => {
     if (watchId !== null) navigator.geolocation.clearWatch(watchId);
-    if (client) client.end();
     if (wakeLock) wakeLock.release();
     watchId = null;
-    client = null;
     stopBtn.style.display = "none";
     startBtn.style.display = "block";
     statusEl.textContent = "Ubicación detenida.";

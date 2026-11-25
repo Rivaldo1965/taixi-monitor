@@ -51,9 +51,7 @@
 </div>
 
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
-<script src="https://unpkg.com/mqtt/dist/mqtt.min.js"></script>
 <script>
-  const BROKER = "wss://broker.hivemq.com:8884/mqtt";
   const LS_CHANNEL = "taixiMonitorChannel";
   const LS_DRIVERS = "taixiMonitorDrivers";
 
@@ -84,6 +82,7 @@
     channel = randomHex(16);
     localStorage.setItem(LS_CHANNEL, channel);
   }
+  const topic = "taixi-monitor-" + channel;
   let drivers = [];
   try { drivers = JSON.parse(localStorage.getItem(LS_DRIVERS) || "[]"); } catch (e) { drivers = []; }
   function saveDrivers() { localStorage.setItem(LS_DRIVERS, JSON.stringify(drivers)); }
@@ -175,6 +174,8 @@
     });
   }
   function showDriver(d, pos) {
+    const prev = lastSeen.get(d.code);
+    if (prev && prev.t >= pos.t) return;
     lastSeen.set(d.code, pos);
     const popup = "<b>" + esc(d.name) + "</b><br>" + esc(d.phone) + "<br>Ubicación: " + ageText(pos.t);
     if (markers.has(d.code)) {
@@ -182,7 +183,7 @@
     } else {
       markers.set(d.code, L.marker([pos.lat, pos.lng], { icon: iconFor(d, pos.t) }).addTo(map).bindPopup(popup));
     }
-    statusEl.textContent = "Choferes compartiendo: " + markers.size;
+    statusEl.textContent = "Conectado. Choferes compartiendo: " + markers.size;
     renderList();
   }
 
@@ -192,23 +193,46 @@
     return JSON.parse(new TextDecoder().decode(plain));
   }
 
-  const client = mqtt.connect(BROKER, { clientId: "taixi-monitor-" + randomHex(6), reconnectPeriod: 5000 });
-  client.on("connect", () => {
-    statusEl.textContent = "Conectado. Choferes compartiendo: " + markers.size;
-    client.subscribe("taixi-monitor/" + channel + "/+");
-  });
-  client.on("reconnect", () => { statusEl.textContent = "Reconectando…"; });
-  client.on("error", () => { statusEl.textContent = "Sin conexión con el servicio de ubicaciones"; });
-  client.on("message", async (topic, message) => {
-    const code = topic.split("/").pop();
-    const d = drivers.find(x => x.code === code);
-    if (!d) return;
+  async function processMessage(text) {
     try {
-      const payload = JSON.parse(message.toString());
-      const pos = await decryptPos(d, payload);
+      const envelope = JSON.parse(text);
+      const d = drivers.find(x => x.code === envelope.d);
+      if (!d) return;
+      const pos = await decryptPos(d, envelope);
       if (Number.isFinite(pos.lat) && Number.isFinite(pos.lng)) showDriver(d, pos);
-    } catch (e) { /* mensaje no válido para este chofer */ }
-  });
+    } catch (e) { /* mensaje no válido para este monitor */ }
+  }
+
+  async function loadCached() {
+    try {
+      const res = await fetch("https://ntfy.sh/" + topic + "/json?poll=1&since=30m");
+      if (!res.ok) return;
+      const text = await res.text();
+      for (const line of text.split("\n")) {
+        if (!line.trim()) continue;
+        try {
+          const evt = JSON.parse(line);
+          if (evt.event === "message" && evt.message) await processMessage(evt.message);
+        } catch (e) { /* línea no válida */ }
+      }
+    } catch (e) { /* sin mensajes guardados */ }
+  }
+
+  function connect() {
+    const source = new EventSource("https://ntfy.sh/" + topic + "/sse");
+    source.onopen = () => {
+      statusEl.textContent = "Conectado. Choferes compartiendo: " + markers.size;
+    };
+    source.onmessage = event => {
+      try {
+        const evt = JSON.parse(event.data);
+        if (evt.event === "message" && evt.message) processMessage(evt.message);
+      } catch (e) { /* evento no válido */ }
+    };
+    source.onerror = () => {
+      statusEl.textContent = "Reconectando…";
+    };
+  }
 
   setInterval(() => {
     markers.forEach((marker, code) => {
@@ -220,6 +244,8 @@
   }, 30000);
 
   renderList();
+  loadCached();
+  connect();
 </script>
 </body>
 </html>
