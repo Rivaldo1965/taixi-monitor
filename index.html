@@ -1,0 +1,127 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TAiXI Monitor</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<style>
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; font-family: system-ui, sans-serif; }
+  #map { position: fixed; inset: 0; }
+  .panel {
+    position: fixed; left: 12px; right: 12px; top: 12px; z-index: 1000;
+    background: rgba(255,255,255,.96); border-radius: 16px; padding: 12px 14px;
+    box-shadow: 0 4px 18px rgba(0,0,0,.18);
+  }
+  .panel h1 { margin: 0 0 4px; font-size: 20px; }
+  .panel p { margin: 0 0 8px; font-size: 14px; line-height: 1.35; }
+  .row { display: flex; gap: 8px; }
+  input { flex: 1; min-width: 0; padding: 10px; border: 1px solid #bbb; border-radius: 10px; font-size: 16px; }
+  button { padding: 10px 14px; border: 0; border-radius: 10px; background: #111827; color: #fff; font-size: 16px; }
+  .status { margin-top: 8px; font-size: 14px; font-weight: 600; }
+  .pin {
+    width: 30px; height: 30px; border-radius: 50%; border: 3px solid #111;
+    display: flex; align-items: center; justify-content: center;
+    color: #fff; font-weight: 800; font-size: 15px;
+  }
+</style>
+</head>
+<body>
+<div id="map"></div>
+<div class="panel">
+  <h1>TAiXI Monitor</h1>
+  <p id="notice">Pantalla de monitoreo lista. Todavía no muestra choferes reales: falta la conexión privada de TAiXI que debe habilitar Steven.</p>
+  <div class="row">
+    <input id="token" type="password" placeholder="Clave de acceso TAiXI" autocomplete="off">
+    <button id="connect">Conectar</button>
+  </div>
+  <div class="status" id="status">Sin conexión</div>
+</div>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script>
+  // La dirección privada la entregará Steven. Nunca se guarda una clave en este archivo.
+  const DRIVERS_ENDPOINT = "";
+  const REFRESH_MS = 15000;
+
+  const map = L.map("map").setView([26.142, -81.795], 12);
+  L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+    maxZoom: 19,
+    attribution: "&copy; OpenStreetMap"
+  }).addTo(map);
+
+  const markers = new Map();
+  const statusEl = document.getElementById("status");
+  let timer = null;
+
+  function colorFor(driver) {
+    const ageMin = (Date.now() - new Date(driver.updated_at).getTime()) / 60000;
+    if (ageMin > 15) return "#f97316"; // ubicación vieja: fuerte y visible
+    if (driver.status === "to_pickup") return "#2563eb";
+    if (driver.status === "in_trip") return "#7c3aed";
+    return "#16a34a";
+  }
+
+  function ageText(updatedAt) {
+    const mins = Math.max(0, Math.round((Date.now() - new Date(updatedAt).getTime()) / 60000));
+    if (mins < 1) return "ahora";
+    if (mins < 60) return "hace " + mins + " min";
+    return "hace " + Math.round(mins / 60) + " h";
+  }
+
+  function iconFor(driver) {
+    return L.divIcon({
+      className: "",
+      html: '<div class="pin" style="background:' + colorFor(driver) + '">T</div>',
+      iconSize: [30, 30],
+      iconAnchor: [15, 15]
+    });
+  }
+
+  function showDrivers(drivers) {
+    const seen = new Set();
+    drivers.forEach(driver => {
+      if (!Number.isFinite(driver.lat) || !Number.isFinite(driver.lng)) return;
+      seen.add(driver.id);
+      const popup = "<b>" + (driver.name || "Chofer") + "</b><br>" +
+        (driver.car || "") + " " + (driver.plate || "") + "<br>" +
+        (driver.phone || "") + "<br>Ubicación: " + ageText(driver.updated_at);
+      if (markers.has(driver.id)) {
+        markers.get(driver.id).setLatLng([driver.lat, driver.lng]).setIcon(iconFor(driver)).setPopupContent(popup);
+      } else {
+        markers.set(driver.id, L.marker([driver.lat, driver.lng], { icon: iconFor(driver) }).addTo(map).bindPopup(popup));
+      }
+    });
+    markers.forEach((marker, id) => {
+      if (!seen.has(id)) { map.removeLayer(marker); markers.delete(id); }
+    });
+    statusEl.textContent = "Choferes en el mapa: " + seen.size;
+  }
+
+  async function loadDrivers() {
+    if (!DRIVERS_ENDPOINT) {
+      statusEl.textContent = "Sin conexión: falta la dirección privada de TAiXI";
+      return;
+    }
+    const token = document.getElementById("token").value.trim();
+    try {
+      const res = await fetch(DRIVERS_ENDPOINT, {
+        headers: token ? { "Authorization": "Bearer " + token } : {}
+      });
+      if (!res.ok) throw new Error("HTTP " + res.status);
+      const data = await res.json();
+      showDrivers(Array.isArray(data) ? data : data.drivers || []);
+    } catch (e) {
+      statusEl.textContent = "No se pudo conectar con TAiXI";
+    }
+  }
+
+  document.getElementById("connect").addEventListener("click", () => {
+    loadDrivers();
+    if (timer) clearInterval(timer);
+    timer = setInterval(loadDrivers, REFRESH_MS);
+  });
+</script>
+</body>
+</html>
