@@ -46,6 +46,12 @@
   <div class="row">
     <button id="add">Agregar chofer</button>
   </div>
+  <div class="row">
+    <button id="importBtn" class="light">Importar lista</button>
+    <button id="exportBtn" class="light">Exportar copia</button>
+    <input id="importFile" type="file" accept=".json,application/json" style="display:none">
+  </div>
+  <p>La copia guarda tu lista y tus enlaces. Guárdala en privado y úsala para restaurar todo en otro navegador.</p>
   <div class="status" id="status">Conectando…</div>
   <div id="list"></div>
 </div>
@@ -154,6 +160,53 @@
     document.getElementById("name").value = "";
     document.getElementById("phone").value = "";
     renderList();
+  });
+
+  function digitsOf(p) { return String(p || "").replace(/\D/g, ""); }
+
+  const importFile = document.getElementById("importFile");
+  document.getElementById("importBtn").addEventListener("click", () => importFile.click());
+  importFile.addEventListener("change", async () => {
+    const file = importFile.files && importFile.files[0];
+    if (!file) return;
+    try {
+      const data = JSON.parse(await file.text());
+      if (Array.isArray(data)) {
+        const existing = new Set(drivers.map(d => digitsOf(d.phone)));
+        let added = 0;
+        data.forEach(item => {
+          const name = String(item.name || item.nombre || "").trim();
+          const phone = String(item.phone || item.telefono || "").trim();
+          if (!name || !phone || existing.has(digitsOf(phone))) return;
+          drivers.push({ name, phone, code: randomHex(4), key: b64u(crypto.getRandomValues(new Uint8Array(32))) });
+          existing.add(digitsOf(phone));
+          added++;
+        });
+        saveDrivers();
+        renderList();
+        alert("Lista importada: " + added + " choferes agregados.");
+      } else if (data && Array.isArray(data.drivers) && data.channel) {
+        if (!confirm("Esto reemplaza tu lista y tus enlaces actuales por los de la copia. ¿Continuar?")) return;
+        localStorage.setItem(LS_CHANNEL, data.channel);
+        localStorage.setItem(LS_DRIVERS, JSON.stringify(data.drivers));
+        location.reload();
+      } else {
+        alert("Ese archivo no es una lista válida para este monitor.");
+      }
+    } catch (e) {
+      alert("No se pudo leer ese archivo.");
+    }
+    importFile.value = "";
+  });
+
+  document.getElementById("exportBtn").addEventListener("click", () => {
+    const backup = JSON.stringify({ channel, drivers }, null, 2);
+    const blob = new Blob([backup], { type: "application/json" });
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = "taixi-monitor-copia.json";
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(a.href), 5000);
   });
 
   function ageText(t) {
